@@ -130,7 +130,7 @@ class FaceSwap:
         return {
             "required": {
                 "input_image": ("IMAGE",),
-                "target_image": ("IMAGE",),
+                "target_images": ("IMAGE",),
                 "swap_model": (list(model_names().keys()),),
                 "facedetection": (["retinaface_resnet50", "retinaface_mobile0.25", "YOLOv5l", "YOLOv5n"],),
                 "face_restore_model": (get_model_names(get_restorers),),
@@ -140,7 +140,7 @@ class FaceSwap:
                 "similarity_threshold":("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "source_image": ("IMAGE", ),
+                "source_images": ("IMAGE", ),
             }
         }
     RETURN_TYPES = ("IMAGE", )
@@ -184,29 +184,17 @@ class FaceSwap:
             # logger.error(no_face_msg)
             return no_face_msg
         
-    def extract_feature(self, compute_method="Mean", images=None):
-        if images is None:
-            logger.error("Please provide `target_image`")
-            return (None,)
-        
-        faces = []
-        embeddings=[]
-        images_list: List[Image.Image] = batch_tensor_to_pil(images)
-        for i, image in enumerate(images_list):
-            face = self.extract_face_feature(image)
-            faces.append(face)
-            embeddings.append(face.embedding)
-            
-        logging.StreamHandler.terminator = "\n"
-        if len(faces) > 0:
-            logger.status(f"Blending with Compute Method '{compute_method}'...")
-            blended_embedding = np.mean(embeddings, axis=0) if compute_method == "Mean" else np.median(embeddings, axis=0) if compute_method == "Median" else stats.mode(embeddings, axis=0)[0].astype(np.float32)
-            logger.status("--Done!--")
-        return blended_embedding
-                
+    def extract_feature(self, compute_method="Mean", image: Image.Image=None):
+        if image is None:
+            logger.error("Please provide `target_images`")
+            return None
+        # pil_image: Image.Image = tensor_to_pil(image)
+        face = self.extract_face_feature(image)
+        return [face.embedding]
+                    
     def execute(self, 
                 input_image, 
-                target_image, 
+                target_images, 
                 swap_model, 
                 facedetection, 
                 face_restore_model, 
@@ -214,96 +202,87 @@ class FaceSwap:
                 codeformer_weight, 
                 face_feature_update, 
                 similarity_threshold=0.5, 
-                source_image=None):
+                source_images=None):
         
         self.similarity_threshold = similarity_threshold
         self.face_feature_update = face_feature_update
-        
-        face_feature = self.extract_feature(images=target_image)
-        # print('face_feature=', face_feature)
-        
-        if source_image is None:
-            logger.info("Please provide `source_image`")
-            return (input_image,)
-            
-        self.face_features.append(face_feature)
+
+        # print('target_images=', target_images)
+        target_pil_images = batch_tensor_to_pil(target_images)
+        for i, target_pil_image in enumerate(target_pil_images):
+            face_feature = self.extract_feature(image=target_pil_image)
+            self.face_features.append(face_feature)
+        print('extract features in target_images=', len(self.face_features))
         
         pil_images = batch_tensor_to_pil(input_image)
-        if source_image is not None:
-            source_img = tensor_to_pil(source_image)
+
+        if source_images is None:
+            logger.info("Please provide `source_images`")
+            return (input_image,)
         else:
-            source_img = None
+            source_pil_imgs = batch_tensor_to_pil(source_images)
+        # else:
+        #     source_pil_imgs = None
         
         if swap_model is not None:
             model_path = model_path = os.path.join(insightface_path, swap_model)
             face_swapper = getFaceSwapModel(model_path)
             
-            if isinstance(source_img, str):  # source_img is a base64 string
-                import base64, io
-                if 'base64,' in source_img:  # check if the base64 string has a data URL scheme
-                    # split the base64 string to get the actual base64 encoded image data
-                    base64_data = source_img.split('base64,')[-1]
-                    # decode base64 string to bytes
-                    img_bytes = base64.b64decode(base64_data)
-                else:
-                    # if no data URL scheme, just decode
-                    img_bytes = base64.b64decode(source_img)
-                
-                source_img = Image.open(io.BytesIO(img_bytes))
-            
-            # if len(pil_images) == 1:
-            #     target_imgs = [cv2.cvtColor(np.array(pil_images), cv2.COLOR_RGB2BGR)]
-            # else:
             target_imgs = [cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR) for target_img in pil_images]
             
-            if source_img is not None:
-                source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
+            if source_pil_imgs is not None:
+                source_imgs = [cv2.cvtColor(np.array(source_pil_img), cv2.COLOR_RGB2BGR) for source_pil_img in source_pil_imgs]
             
-            source_faces = analyze_faces(source_img)
-            source_face = source_faces[0]
+            source_faces=[]
+            for i, source_img in enumerate(source_imgs):
+                # print("source_img=",source_img)
+                faces = analyze_faces(source_img)
+                # print(f"{i}-", faces)
+                source_faces.append(faces[0])
             
-            def calc_similarity(vec1, vec2):
+            def similarity(vec1, vec2):
                 dot_product = np.dot(vec1, vec2)
                 norm_vec1 = np.linalg.norm(vec1)
                 norm_vec2 = np.linalg.norm(vec2)
                 return dot_product / (norm_vec1 * norm_vec2)
+            
+            def calc_similarity(vec:np.array, veclist:List[np.array]):
+                sims=[]
+                for vec2 in veclist:
+                    sim = similarity(vec, vec2)
+                    sims.append(sim)
+                return max(sims)
             
             results = target_imgs
             for i, target_img in enumerate(target_imgs):
                 result = target_img
                 
                 target_faces = analyze_faces(target_img)
-                similarities=[]
+                # similarities=[]
                 for tface in target_faces:
-                    target_similarities=[]
-                    for feature in self.face_features:
-                        similarity = calc_similarity(tface.embedding, feature)
-                        target_similarities.append(similarity)
-                    max_similarity = max(target_similarities)
-                    similarities.append(max_similarity)
-
-                target_face_single = None
-                if max(similarities) >= self.similarity_threshold:
-                    tindex = np.argmax(similarities)
-                    target_face_single = target_faces[tindex]
-                    if self.face_feature_update:
-                        self.face_features.append(target_face_single.embedding)
-                
-                if target_face_single is not None:
-                    if self.face_boost_enabled:
-                        logger.status(f"Face Boost is enabled")
-                        result = face_swapper.get(target_img, target_face_single, source_face)
-                        bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
-                        bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
-                        M *= scale
-                        result = swapper.in_swap(target_img, bgr_fake, M)
-                    else:
-                        result = face_swapper.get(target_img, target_face_single, source_face)
-                
+                    similarities=[]
+                    for features in self.face_features:
+                        sim = calc_similarity(tface.embedding, features)
+                        similarities.append(sim)
+                    max_similarity = max(similarities)
+                    # similarities.append(max_similarity)
+                    if max_similarity >= self.similarity_threshold:
+                        sindex = np.argmax(similarities)
+                        source_face = source_faces[sindex]
+                        self.face_features[sindex].append(tface.embedding)
+                        
+                        if self.face_boost_enabled:
+                            logger.status(f"Face Boost is enabled")
+                            result = face_swapper.get(result, tface, source_face)
+                            bgr_fake, M = face_swapper.get(result, tface, source_face, paste_back=False)
+                            bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, self.interpolation)
+                            M *= scale
+                            result = swapper.in_swap(result, bgr_fake, M)
+                        else:
+                            result = face_swapper.get(result, tface, source_face)
                 results[i] = result
 
             result_images = [Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB)) for result in results]
-            
             result_images = batched_pil_to_tensor(result_images)
 
             if self.restore:
